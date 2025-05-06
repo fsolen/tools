@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# Script to check unsupported items and discovery rules in Zabbix 7 and export results to CSV 
+
 import requests
 import getpass
 import csv
