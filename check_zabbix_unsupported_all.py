@@ -7,6 +7,9 @@ import getpass
 import csv
 from collections import defaultdict
 
+def sanitize_text(text):
+    return text.replace('\n', ' ').replace('\r', ' ').strip()
+
 def zabbix_api(method, params, auth=None):
     response = requests.post(
         f"{ZABBIX_URL}/api_jsonrpc.php",
@@ -19,43 +22,36 @@ def zabbix_api(method, params, auth=None):
         },
         headers={"Content-Type": "application/json"}
     )
-
     response.raise_for_status()
     data = response.json()
-
     if "error" in data:
-        print(f"\nZabbix API Error ({method}): {data['error']['message']} - {data['error']['data']}")
+        print(f"\n Zabbix API Error ({method}): {data['error']['message']} - {data['error']['data']}")
         exit(1)
-
     return data["result"]
 
 def prompt_credentials():
     global ZABBIX_URL
     while True:
-        url = input("Enter Zabbix URL (e.g. http://localhost/zabbix): ").strip().rstrip('/')
+        url = input(" Enter Zabbix URL (e.g. http://192.168.1.100/zabbix): ").strip().rstrip('/')
         if url:
             ZABBIX_URL = url
             break
         else:
-            print("Please enter a valid Zabbix URL.")
-    user = input("Username: ").strip()
-    password = getpass.getpass("Password: ").strip()
+            print(" Please enter a valid Zabbix URL.")
+    user = input(" Username: ").strip()
+    password = getpass.getpass(" Password: ").strip()
     return user, password
 
-def add_unsupported(group_key, title, entities, grouped_dict):
-    if entities:
-        for ent in entities:
-            grouped_dict[group_key].append([title, ent['name'], ent['error']])
-
-def check_templates(auth_token, lld_grouped):
+def check_templates(auth_token):
+    results = defaultdict(list)
     templates = zabbix_api("template.get", {
         "output": ["templateid", "name"]
     }, auth_token)
 
-    print(f"\nChecking {len(templates)} templates...\n")
+    print(f"\n Checking {len(templates)} templates...\n")
 
     for tpl in templates:
-        print(f"Template: {tpl['name']}")
+        print(f" Template: {tpl['name']}")
 
         llds = zabbix_api("discoveryrule.get", {
             "output": ["name", "error"],
@@ -63,18 +59,22 @@ def check_templates(auth_token, lld_grouped):
             "filter": {"state": "1"}
         }, auth_token)
 
-        add_unsupported(tpl["name"], "Unsupported Discovery Rule", llds, lld_grouped)
+        for rule in llds:
+            results[tpl['name']].append(["Unsupported Discovery Rule", rule['name'], sanitize_text(rule['error'])])
 
-def check_hosts(auth_token, item_grouped):
+    return results
+
+def check_hosts(auth_token):
+    results = defaultdict(list)
     hosts = zabbix_api("host.get", {
         "output": ["hostid", "name"],
-        "filter": {"status": "0"}
+        "filter": {"status": "0"}  # only monitored hosts
     }, auth_token)
 
-    print(f"\nChecking {len(hosts)} monitored hosts...\n")
+    print(f"\n Checking {len(hosts)} monitored hosts...\n")
 
     for host in hosts:
-        print(f"Host: {host['name']}")
+        print(f" Host: {host['name']}")
 
         items = zabbix_api("item.get", {
             "output": ["name", "error"],
@@ -82,38 +82,36 @@ def check_hosts(auth_token, item_grouped):
             "filter": {"state": "1"}
         }, auth_token)
 
-        add_unsupported(host["name"], "Unsupported Item", items, item_grouped)
+        for item in items:
+            results[host['name']].append(["Unsupported Item", item['name'], sanitize_text(item['error'])])
 
-def export_grouped_to_csv(filename, grouped_dict, group_type):
+    return results
+
+def export_grouped_to_csv(grouped_data, filename, group_label):
     with open(filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        writer.writerow([group_type, "Type", "Name", "Error"])
-
-        for group, entities in grouped_dict.items():
-            for row in entities:
+        writer.writerow([group_label, "Type", "Name", "Error"])
+        for group, entries in grouped_data.items():
+            for row in entries:
                 writer.writerow([group] + row)
-
-    print(f"Exported to {filename}")
+    print(f"Exported data to {filename}")
 
 def main():
     user, password = prompt_credentials()
 
-    print("\nAuthenticating to Zabbix...")
+    print(" Authenticating to Zabbix...")
     auth_token = zabbix_api("user.login", {
         "username": user,
         "password": password
     })
 
-    item_grouped = defaultdict(list)  # host → items
-    lld_grouped = defaultdict(list)   # template → discovery rules
+    template_data = check_templates(auth_token)
+    host_data = check_hosts(auth_token)
 
-    check_templates(auth_token, lld_grouped)
-    check_hosts(auth_token, item_grouped)
+    export_grouped_to_csv(template_data, "zabbix_unsupported_discovery_rules_by_template.csv", "Template")
+    export_grouped_to_csv(host_data, "zabbix_unsupported_items_by_host.csv", "Host")
 
-    export_grouped_to_csv("zabbix_unsupported_items_by_host.csv", item_grouped, "Host")
-    export_grouped_to_csv("zabbix_unsupported_discovery_rules_by_template.csv", lld_grouped, "Template")
-
-    print("\nUnsupported item check complete.")
+    print("\n Full unsupported item and discovery rule check complete.")
 
 if __name__ == "__main__":
     main()
