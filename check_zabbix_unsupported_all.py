@@ -32,7 +32,7 @@ def zabbix_api(method, params, auth=None):
 def prompt_credentials():
     global ZABBIX_URL
     while True:
-        url = input(" Enter Zabbix URL (e.g. http://192.168.1.100/zabbix): ").strip().rstrip('/')
+        url = input(" Enter Zabbix URL (e.g. http://localhost/zabbix): ").strip().rstrip('/')
         if url:
             ZABBIX_URL = url
             break
