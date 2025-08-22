@@ -7,3 +7,4 @@ ACTION=="add|change", KERNEL=="dm-[0-9]*", SUBSYSTEM=="block", ENV{DM_UUID}=="mp
 # (Some kernels expose read_ahead_kb under queue/, harmless if missing)
 ACTION=="add|change", KERNEL=="dm-[0-9]*", SUBSYSTEM=="block", ENV{DM_UUID}=="mpath-*", ATTR{queue/read_ahead_kb}="128"
 EOF
+udevadm control --reload-rules && udevadm trigger
