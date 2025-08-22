@@ -36,6 +36,12 @@ for i in {1..10}; do
     fi
     sleep 1
 done
+
+# Tune multipath dm-* devices
+for dm in /dev/mapper/PureStorage-*; do
+    [ -e "$dm" ] || continue
+    blockdev --setra 256 "$dm"
+done
 EOF
 
 sudo chmod +x /usr/local/sbin/purestorage-tune.sh
