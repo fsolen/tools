@@ -116,6 +116,27 @@ for IP in "${IPS[@]}"; do
         echo "  GW: $GW  |  Interface: $GW_IFACE"
     fi
 
+    # Non-default routes
+    echo ""
+    echo "[Routes]"
+
+    ROUTE_RAW=$(ssh $SSH_OPTS "${SSH_USER}@${IP}" \
+        "ip route show | grep -v '^default' | grep -v '^$'" \
+        || true)
+
+    if [[ -z "$ROUTE_RAW" ]]; then
+        echo "  (No non-default routes found)"
+    else
+        echo "$ROUTE_RAW" | while IFS= read -r line; do
+            DEST=$(echo "$line" | awk '{print $1}')
+            GW=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+            DEV=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+            [[ -z "$GW" ]] && GW="-"
+            [[ -z "$DEV" ]] && DEV="-"
+            printf "  %-20s | %-15s | %s\n" "$DEST" "$GW" "$DEV"
+        done
+    fi
+
     # DNS records: for ALL IP addresses on remote server
     echo ""
     echo "[DNS Records]"
