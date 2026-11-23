@@ -6,8 +6,10 @@
 # Her kaydı Kubernetes tarafındaki karşılığıyla eşleştirir:
 # PV/PVC, VirtualMachine, VolumeSnapshot/VolumeSnapshotContent.
 # Ceph'te olup Kubernetes'te karşılığı olmayan kayıtları ORPHAN olarak işaretler.
-# Cluster üzerinde HİÇBİR değişiklik yapmaz: yalnızca "oc get" ve toolbox
-# pod'unda "rbd info/ls/snap ls/children" komutlarını çalıştırır.
+# Varsayılan olarak cluster üzerinde HİÇBİR değişiklik yapmaz: yalnızca "oc get"
+# ve toolbox pod'unda "rbd info/ls/snap ls/children/du" komutlarını çalıştırır.
+# İSTİSNA: -X / --execute verilirse flatten planındaki image'ları tek tek
+# "rbd flatten" ile flatten eder (onay, kapasite kontrolü ve log ile).
 #
 # Gereksinimler: oc (cluster-admin), jq, Running durumda rook-ceph-tools pod'u.
 
@@ -27,6 +29,10 @@ DEFAULT_POOL="ocs-storagecluster-cephblockpool"
 ALERT_LIMIT=200
 PLAN_SIZE=""
 CMDS_ONLY=0
+EXECUTE=0
+ASSUME_YES=0
+SLEEP_SECS=10
+MIN_FREE_PCT=50
 # ceph-csi varsayılanları (--minsnapshotsonimage / --maxsnapshotsonimage)
 CSI_MIN_SNAPS="${CSI_MIN_SNAPS:-250}"
 CSI_MAX_SNAPS="${CSI_MAX_SNAPS:-450}"
@@ -52,6 +58,13 @@ Seçenekler:
   -L <n>      Alarm eşiği (flatten planı bunun altına indirecek kadar aday seçer) (varsayılan: ${ALERT_LIMIT})
   -N <n>      Flatten planındaki aday sayısı (varsayılan: eşiğin altına inmek için gereken)
   -F          Sadece flatten planının komutlarını yazdır (çalıştırmaz; gözden geçirip uygulayın)
+
+Flatten çalıştırma (CLUSTER'DA DEĞİŞİKLİK YAPAR):
+  -X, --execute  Flatten planındaki image'ları tek tek "rbd flatten" ile flatten et
+  -y          Başlangıç onayını atla
+  -s <sn>     İki flatten arası bekleme, saniye   (varsayılan: ${SLEEP_SECS})
+  -m <%>      Pool boş alanı bu yüzdenin altına düşerse dur; 0 = kontrol yok (varsayılan: ${MIN_FREE_PCT})
+
   -h          Bu yardım
   -V          Sürüm
 
@@ -59,6 +72,7 @@ Seçenekler:
   $(basename "$0") csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971
   $(basename "$0") -o json csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971 > rapor.json
   $(basename "$0") -F csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971 > flatten-plan.sh
+  $(basename "$0") -X -N 20 csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971
   $(basename "$0") -a -t 150
 
 Ortam değişkenleri: CSI_MIN_SNAPS (250), CSI_MAX_SNAPS (450): ceph-csi flatten limitleri
@@ -68,9 +82,17 @@ EOF
 die()  { echo "HATA: $*" >&2; exit 1; }
 info() { echo ">> $*" >&2; }
 
-if [ "${1:-}" = "--help" ]; then usage; exit 0; fi
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --help) usage; exit 0 ;;
+    --execute) ARGS+=("-X") ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
-while getopts ":n:p:r:o:t:T:L:N:FavhV" opt; do
+while getopts ":n:p:r:o:t:T:L:N:s:m:FXyavhV" opt; do
   case "$opt" in
     n) ODF_NS="$OPTARG" ;;
     p) POOL="$OPTARG" ;;
@@ -81,6 +103,10 @@ while getopts ":n:p:r:o:t:T:L:N:FavhV" opt; do
     L) ALERT_LIMIT="$OPTARG" ;;
     N) PLAN_SIZE="$OPTARG" ;;
     F) CMDS_ONLY=1 ;;
+    X) EXECUTE=1 ;;
+    y) ASSUME_YES=1 ;;
+    s) SLEEP_SECS="$OPTARG" ;;
+    m) MIN_FREE_PCT="${OPTARG%\%}" ;;
     a) SCAN=1 ;;
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
@@ -97,6 +123,13 @@ case "$TOP" in ''|*[!0-9]*) die "-T sayı olmalı" ;; esac
 case "$ALERT_LIMIT" in ''|*[!0-9]*) die "-L sayı olmalı" ;; esac
 case "$PLAN_SIZE" in *[!0-9]*) die "-N sayı olmalı" ;; esac
 case "$CSI_MIN_SNAPS$CSI_MAX_SNAPS" in *[!0-9]*) die "CSI_MIN_SNAPS / CSI_MAX_SNAPS sayı olmalı" ;; esac
+case "$SLEEP_SECS" in ''|*[!0-9]*) die "-s sayı olmalı" ;; esac
+case "$MIN_FREE_PCT" in ''|*[!0-9]*) die "-m 0-100 arası sayı olmalı" ;; esac
+[ "$MIN_FREE_PCT" -le 100 ] || die "-m 0-100 arası sayı olmalı"
+if [ "$EXECUTE" -eq 1 ]; then
+  [ "$SCAN" -eq 0 ] || die "-X, -a ile birlikte kullanılamaz"
+  [ "$CMDS_ONLY" -eq 0 ] || die "-X ve -F birlikte kullanılamaz"
+fi
 
 if [ "$SCAN" -eq 0 ]; then
   [ $# -eq 1 ] || { usage >&2; exit 1; }
@@ -124,8 +157,8 @@ EOF
   exit 2
 fi
 
-rbd()  { oc -n "$ODF_NS" exec "$TOOLS" -- rbd "$@"; }
-ceph() { oc -n "$ODF_NS" exec "$TOOLS" -- ceph "$@"; }
+rbd()  { oc -n "$ODF_NS" exec "$TOOLS" -- rbd "$@" </dev/null; }
+ceph() { oc -n "$ODF_NS" exec "$TOOLS" -- ceph "$@" </dev/null; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/rbd-snap-report.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
@@ -400,6 +433,110 @@ jq -n \
           | "\($bykind.trash) child RBD trash içinde; kendi child\u0027ları temizlenince silinirler (README: Senaryo D)." )
       ]
     }' > "$TMP/report.json"
+
+# ---------------------------------------------------------------------------
+# Flatten çalıştırma (-X): flatten_plan.items listesini tek tek işler
+# ---------------------------------------------------------------------------
+pool_free_pct() {
+  ceph df --format json 2>/dev/null | jq -r --arg p "$POOL" '
+    ([.pools[]? | select(.name == $p) | .stats] | .[0]) as $s
+    | if $s != null and $s.max_avail != null and (($s.stored // 0) + $s.max_avail) > 0
+      then ($s.max_avail * 100 / (($s.stored // 0) + $s.max_avail) | floor)
+      elif (.stats.total_bytes // 0) > 0
+      then (.stats.total_avail_bytes * 100 / .stats.total_bytes | floor)
+      else empty end'
+}
+
+image_parent() { # <spec> -> parent image adı (yoksa boş); okunamazsa exit 1
+  rbd info --format json "$1" 2>/dev/null | jq -er '.parent.image // ""'
+}
+
+run_flatten() {
+  local n total spec img label pct parent start dur
+  local done_n=0 skipped=0 failed=0 stop=0
+  local log
+  log="./rbd-flatten-${IMAGE}-$(date +%Y%m%d-%H%M%S).log"
+  total=$(jq '.flatten_plan.items | length' "$TMP/report.json")
+
+  if [ "$total" -eq 0 ]; then
+    echo "Flatten planı boş; yapılacak iş yok."
+    return 0
+  fi
+
+  jq -r '
+    "=== FLATTEN: \(.pool)/\(.image) ===",
+    "Mevcut sayı \(.flatten_plan.current_count), alarm eşiği \(.flatten_plan.alert_limit), plandaki image: \(.flatten_plan.items | length)",
+    "Tahmini ek kapasite (üst sınır): \(if .flatten_plan.estimated_capacity_bytes then "\(.flatten_plan.estimated_capacity_bytes / 1073741824 | floor) GiB" else "bilinmiyor" end)",
+    ( .flatten_plan.items[] | "  \(.image)  \(.namespace // "-")/\(.vm // "-") (\(.vm_status // "-"))" )
+  ' "$TMP/report.json"
+  echo "Bekleme: ${SLEEP_SECS}s, en düşük boş alan: %${MIN_FREE_PCT}, log: $log"
+
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    ( : </dev/tty ) 2>/dev/null || die "onay için terminal yok; otomasyonda -y kullanın"
+    local answer
+    printf '\nDevam etmek için kaynak image adını yazın (%s): ' "$IMAGE" > /dev/tty
+    read -r answer < /dev/tty || answer=""
+    [ "$answer" = "$IMAGE" ] || { echo "Onay verilmedi, çıkılıyor."; return 1; }
+  fi
+
+  log_line() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$log"; }
+  trap 'stop=1; echo; echo ">> Durdurma istendi (Ctrl-C). Kesilen flatten varsa Ceph tarafında yarım kalmış olabilir; rbd info ile kontrol edin." >&2' INT
+
+  log_line "BAŞLADI $POOL/${RADOS_NS:+$RADOS_NS/}$IMAGE plan=$total"
+  n=0
+  while IFS=$'\t' read -r img label; do
+    n=$((n + 1))
+    [ "$stop" -eq 0 ] || break
+    spec="$POOL/${RADOS_NS:+$RADOS_NS/}$img"
+
+    if [ "$MIN_FREE_PCT" -gt 0 ]; then
+      pct=$(pool_free_pct || true)
+      if [ -z "$pct" ]; then
+        log_line "[$n/$total] DUR: ceph df okunamadı (kapasite kontrolü için -m 0 ile kapatılabilir)"; failed=$((failed + 1)); break
+      fi
+      if [ "$pct" -lt "$MIN_FREE_PCT" ]; then
+        log_line "[$n/$total] DUR: pool boş alanı %$pct < %$MIN_FREE_PCT"; failed=$((failed + 1)); break
+      fi
+    fi
+
+    if ! parent=$(image_parent "$spec"); then
+      log_line "[$n/$total] HATA: rbd info okunamadı: $spec ($label)"; failed=$((failed + 1)); break
+    fi
+    if [ -z "$parent" ]; then
+      log_line "[$n/$total] ATLANDI (parent yok, zaten flatten edilmiş): $img ($label)"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    log_line "[$n/$total] FLATTEN: $img ($label) parent=$parent boş=%${pct:-?}"
+    start=$(date +%s)
+    if ! rbd flatten --no-progress "$spec" >>"$log" 2>&1; then
+      log_line "[$n/$total] HATA: rbd flatten başarısız: $img (ayrıntı: $log)"; failed=$((failed + 1)); break
+    fi
+    dur=$(( $(date +%s) - start ))
+
+    if ! parent=$(image_parent "$spec") || [ -n "$parent" ]; then
+      log_line "[$n/$total] HATA: flatten sonrası parent hâlâ var veya okunamadı: $img"; failed=$((failed + 1)); break
+    fi
+    done_n=$((done_n + 1))
+    log_line "[$n/$total] TAMAM: $img ${dur}s"
+
+    if [ "$n" -lt "$total" ] && [ "$stop" -eq 0 ] && [ "$SLEEP_SECS" -gt 0 ]; then
+      sleep "$SLEEP_SECS" || true
+    fi
+  done < <(jq -r '.flatten_plan.items[] | [.image, "\(.namespace // "-")/\(.vm // .pvc // "-")"] | @tsv' "$TMP/report.json")
+  trap - INT
+
+  local snaps children
+  snaps=$(rbd snap ls --all --format json "$SPEC" 2>/dev/null | jq 'length' 2>/dev/null || true)
+  children=$(rbd children --all --format json "$SPEC" 2>/dev/null | jq 'length' 2>/dev/null || true)
+  log_line "BİTTİ yapılan=$done_n atlanan=$skipped hata=$failed plan=$total | kaynakta şimdi: snapshot=${snaps:-?} direct_child=${children:-?}"
+  [ "$failed" -eq 0 ] && [ "$stop" -eq 0 ]
+}
+
+if [ "$EXECUTE" -eq 1 ]; then
+  run_flatten
+  exit $?
+fi
 
 if [ "$CMDS_ONLY" -eq 1 ]; then
   jq -r '
