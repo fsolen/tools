@@ -8,7 +8,7 @@ Bu klasör, alarmın sebebini bulmak ve gidermek için gereken araçları içeri
 
 | Dosya | Açıklama |
 |---|---|
-| `rbd-snap-report.sh` | Salt okunur analiz scripti. Cluster'da hiçbir şeyi değiştirmez. |
+| `rbd-snap-report.sh` | Analiz scripti. Varsayılan olarak salt okunurdur; yalnızca `-X` verilirse flatten planını uygular. |
 | `README.md` | Bu runbook. |
 
 ---
@@ -66,12 +66,25 @@ chmod +x rbd-snap-report.sh
 ./rbd-snap-report.sh -a -t 150
 ```
 
-Seçenekler: `-n` ODF namespace'i, `-p` pool, `-r` RADOS namespace'i, `-T` liste uzunluğu, `-h` yardım.
+Seçenekler:
+
+- `-n` ODF namespace'i, `-p` pool, `-r` RADOS namespace'i
+- `-T` liste uzunluğu
+- `-L` alarm eşiği (varsayılan 200)
+- `-N` flatten planındaki aday sayısı
+- `-F` sadece flatten komutlarını yazdır
+- `-X` / `--execute` flatten planını tek tek uygula (`-y` onay atla, `-s` bekleme sn, `-m` en düşük boş alan %)
+- `-h` yardım
+
+ceph-csi limitleri varsayılandan farklıysa `CSI_MIN_SNAPS` ve `CSI_MAX_SNAPS` ortam değişkenleriyle verilebilir.
 
 Script'in yaptıkları:
 
 1. Image'ı **PV → PVC → owner (DataVolume) → VirtualMachine** zincirine eşleştirir.
-2. Image bir CNV golden image ise ilgili **DataSource** ve **DataImportCron** kayıtlarını gösterir.
+2. Kaynağın golden image olup olmadığını tespit eder:
+   - CNV'nin yönettiği golden image ise ilgili **DataSource** ve **DataImportCron** kayıtlarını gösterir.
+   - Custom bir template PVC'yse (kendisi VM diski değil, VM'lerin clone kaynağı) bunu ayrıca belirtir.
+   - ceph-csi'nin otomatik flatten limitlerine (250/450) göre durumu, mgr kuyruğundaki flatten görevlerini ve bir **flatten planını** (adaylar + tahmini kapasite) gösterir.
 3. `rbd snap ls --all` ve `rbd children --all --descendants` ile snapshot'ları ve child'ları listeler. Her child şu türlerden birine atanır:
 
 | Tür | Anlamı |
@@ -109,43 +122,123 @@ oc -n openshift-storage exec "$TOOLS" -- ceph -s
 oc -n openshift-storage exec "$TOOLS" -- ceph df
 ```
 
-### Senaryo A: CNV golden image'dan çok sayıda VM clone'lanmış
+### Senaryo A: CNV golden image veya custom template'den çok sayıda VM clone'lanmış
 
-Raporda çok sayıda `clone-intermediate` / `pvc-clone` child görürsünüz, VM adları dolu olur ve büyük ihtimalle `Golden image: EVET` yazar.
+Raporda çok sayıda `clone-intermediate` / `pvc-clone` child görürsünüz ve VM adları dolu olur. `Golden image` satırı iki tür kaynağı ayırt eder:
 
-1. **Kullanılmayan VM'leri temizleyin.** VM silindiğinde DataVolume ve PVC de silinir, ceph-csi child image'ı kaldırır:
+- **`EVET (DataSource/DataImportCron)`:** CNV'nin otomatik import ettiği golden image.
+- **`EVET (custom template PVC)`:** Kendisi bir VM diski olmayan, ama VM'lerin clone kaynağı olarak kullanılan PVC. Örnek: `os-templates/template-debian-12-latest`.
 
-   ```bash
-   jq -r '.children[] | select(.vm) | "\(.namespace) \(.vm)"' rapor.json | sort -u
-   oc delete vm <vm> -n <ns>
-   ```
+#### ceph-csi'nin snapshot limitleri (önemli)
 
-2. **Kalması gereken VM disklerini kaynaktan ayırın (flatten).** Flatten, child'ın verisini kendine kopyalar ve parent bağını koparır. Böylece kaynak image'ın child sayısı düşer.
-   - Önce `-temp` ara image'ı (direct child) flatten edin. Ara image yoksa `csi-vol-*` diskini flatten edin.
-   - Flatten **thin olan clone'u tam boyuta getirir.** VM sayısı × disk boyutu kadar ek kapasite gerekebilir; önce `ceph df` ile kontrol edin.
-   - Online yapılabilir ama I/O yükü oluşturur. Mesai dışında ve **tek tek** çalıştırın.
+ceph-csi, bir PVC'yi clone'larken kaynak image'da bir snapshot oluşturur ve bunu hemen trash'e taşır. Bu yüzden raporda kaynakta her VM için **bir `trash` snapshot** ve **bir `-temp` child** görürsünüz. Kaynaktan **yeni bir clone** oluşturulurken ceph-csi kaynaktaki snapshot sayısını kontrol eder:
 
-   ```bash
-   # Flatten adaylarını listele (direct child'lar)
-   jq -r '.children[] | select(.direct and (.kind=="clone-intermediate" or .kind=="pvc-clone"))
-          | "\(.pool)/\(.image)  # \(.namespace)/\(.vm)"' rapor.json
+| Durum | ceph-csi davranışı |
+|---|---|
+| sayı > `minsnapshotsonimage` (varsayılan **250**) | Tüm `-temp` child'lar için Ceph mgr'a flatten görevi (`ceph rbd task add flatten`) ekler; clone işlemi devam eder. |
+| sayı > `maxsnapshotsonimage` (varsayılan **450**) | Aynı flatten görevlerini ekler, ama clone işlemini **`ResourceExhausted`** hatasıyla reddeder. Bu kaynaktan yeni VM oluşturulamaz. |
 
-   # Tek bir image için
-   rbd flatten "$POOL/csi-vol-<uuid>-temp"
-   rbd info "$POOL/csi-vol-<uuid>-temp" | grep parent   # çıktı boş olmalı
-   ```
+Kaynak: ceph-csi `flattenTemporaryClonedImages` (internal/rbd/controllerserver.go).
 
-   Son child da ayrıldığında kaynak image'daki `trash` snapshot'ları Ceph tarafından otomatik olarak temizlenir.
+Rapordaki **"ceph-csi otomatik flatten durumu"** bölümü mevcut durumu gösterir. **Soft limit aşıldıysa**, şablondan oluşturulacak bir sonraki VM, yüzlerce flatten görevini aynı anda kuyruğa ekletir. Bu ani kapasite ve I/O yükü demektir. Bunu beklemeden kontrollü flatten yapın.
 
-3. **Yeni VM'lerin aynı image'a bağlanmasını önleyin.**
-   - DataImportCron'un düzenli çalıştığını kontrol edin (`lastImport`, `schedule`). Yeni import'tan sonra yeni VM'ler yeni kaynağa bağlanır.
-   - Golden image'ın formatını (PVC veya snapshot) ve clone stratejisini kontrol edin:
+Kuyruktaki görevleri izlemek için:
 
-     ```bash
-     oc get storageprofile ocs-storagecluster-ceph-rbd-virtualization -o yaml
-     ```
+```bash
+oc -n openshift-storage exec "$TOOLS" -- ceph rbd task list
+```
 
-   - Çok sayıda VM'in aynı kaynaktan sürekli üretildiği ortamlarda (VDI, test vb.) bu VM'lerin disklerini periyodik olarak flatten etmek bir süreç haline getirilmelidir.
+#### 1. Kullanılmayan VM'leri temizleyin
+
+VM silindiğinde DataVolume ve PVC de silinir; ceph-csi child image'ı ve ona ait trash snapshot'ı kaldırır:
+
+```bash
+jq -r '.children[] | select(.vm) | "\(.namespace) \(.vm) \(.vm_status)"' rapor.json | sort -u
+oc delete vm <vm> -n <ns>
+```
+
+#### 2. Kalacak VM disklerini kaynaktan ayırın (flatten)
+
+Flatten, child'ın verisini kendine kopyalar ve parent bağını koparır. Her flatten edilen `-temp` child, kaynaktaki **child sayısını ve trash snapshot sayısını birer azaltır**.
+
+Script, alarm eşiğinin altına inmek için gereken sayıda adayı seçer. Sıralama:
+
+1. Durdurulmuş VM'ler
+2. VM'e bağlı olmayan PVC'ler
+3. Çalışan VM'ler
+
+Her grupta en eski PVC önce gelir. Mgr kuyruğunda zaten bekleyen görevler gereken sayıdan düşülür.
+
+Planı iki şekilde uygulayabilirsiniz.
+
+**Önerilen: script'in kendisiyle (`-X` / `--execute`)**
+
+```bash
+# 1. Planı görün
+./rbd-snap-report.sh -F csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971
+
+# 2. Parça parça çalıştırın (ör. her seferinde 20 image)
+./rbd-snap-report.sh -X -N 20 csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971
+
+# Seçenekler: -s 30 (iki flatten arası 30 sn), -m 40 (boş alan %40'ın altına düşerse dur), -y (onay sorma)
+```
+
+`-X` modunun davranışı:
+
+- **Onay:** Başlamadan önce planı gösterir ve onay için **kaynak image adını** yazmanızı ister. `-y` ile bu adım atlanır.
+- **Her image için tek tek:**
+  1. Pool boş alanını kontrol eder (`ceph df`). Varsayılan eşik **%50**; altındaysa durur. `-m 0` kontrolü kapatır.
+  2. Image'ın hâlâ parent'ı olup olmadığına bakar. Parent yoksa image zaten flatten edilmiştir, atlanır.
+  3. `rbd flatten` çalıştırır ve parent'ın kalktığını doğrular.
+  4. Bir sonraki image'dan önce bekler (varsayılan **10 sn**, `-s` ile değişir).
+- **Hata:** İlk hatada durur ve exit kodu 1 döner. Tekrar çalıştırdığınızda plan yeniden hesaplanır; tamamlanmış image'lar zaten plana girmez.
+- **Ctrl-C:** Durdurur ve özet basar. Bir flatten tam çalışırken kesilirse, o image'ı `rbd info` ile kontrol edin.
+- **Log:** Her adım ekrana ve `./rbd-flatten-<image>-<tarih>.log` dosyasına yazılır. Bitişte yapılan/atlanan/hata sayıları ve kaynaktaki yeni snapshot/child sayıları gösterilir.
+- **Ne yapmaz:** Trash'teki snapshot'lara dokunmaz. VM disklerinin kendisini (`csi-vol-<uuid>`) değil, aradaki `-temp` image'ları flatten eder. VM'ler çalışmaya devam eder.
+
+**Alternatif: komut dosyası üretip elle çalıştırmak**
+
+```bash
+# Plan (komutları yalnızca yazdırır, çalıştırmaz)
+./rbd-snap-report.sh -F csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971 > flatten-plan.sh
+./rbd-snap-report.sh -F -N 100 csi-vol-…   # eşik yerine sabit 100 aday
+./rbd-snap-report.sh -F -L 150 csi-vol-…   # hedef: 150'nin altı
+
+# Gözden geçirin, kapasiteyi kontrol edin, sonra çalıştırın
+less flatten-plan.sh
+oc -n openshift-storage exec "$TOOLS" -- ceph df
+bash flatten-plan.sh
+```
+
+Dikkat edilecekler:
+
+- **Kapasite:** Flatten, thin olan clone'a kaynak image'ın verisini kopyalar. Raporda "Tahmini ek kapasite" satırı `kaynak used_size × adet` olarak bir üst sınır verir. Replica 3 pool'da ham kullanım bunun 3 katıdır.
+- **I/O:** Flatten online yapılabilir (VM çalışırken), ama ek yük oluşturur. Planı mesai dışında çalıştırın ve parçalara bölün (`-X -N 20` veya `head -n 30 flatten-plan.sh`).
+- **Kontrol:**
+
+  ```bash
+  rbd info "$POOL/csi-vol-<uuid>-temp" | grep parent   # çıktı boş olmalı
+  ./rbd-snap-report.sh csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971   # sayılar düşmeli
+  ```
+
+#### 3. Yeni VM'lerin aynı kaynağa birikmesini önleyin
+
+**DataImportCron ile yönetilen golden image:** DataImportCron'un düzenli çalıştığını kontrol edin (`lastImport`, `schedule`). Yeni import'tan sonra yeni VM'ler yeni kaynağa bağlanır.
+
+**Custom template PVC:** Template'i periyodik olarak **yeni bir sürüme döndürün**. Örneğin VM sayısı ~150'ye ulaştığında:
+
+1. Mevcut template'ten yeni bir PVC oluşturun (ör. `template-debian-12-v2`). Bunu bir DataVolume ile, `source.pvc` olarak mevcut template'i göstererek yapın.
+2. Yeni PVC'nin `-temp` image'ını `rbd flatten` ile flatten edin. Böylece yeni template eskisinden tamamen bağımsız olur.
+3. VM oluşturma akışını (OpenShift Template, GitOps manifestleri, DataVolume `source.pvc`) yeni PVC'ye çevirin.
+   - Önerilen yöntem: Template'e bir **DataSource** üzerinden erişin (`sourceRef: {kind: DataSource, name: debian-12, namespace: os-templates}`).
+   - Bu durumda rotasyon için yalnızca DataSource'un `spec.source.pvc` alanını güncellemek yeterlidir.
+4. Eski template'e bağlı VM'ler çalışmaya devam eder. Eski image'ın sayısı sabit kalır, artmaz.
+
+**Alternatif:** İlgili StorageProfile'da `spec.cloneStrategy: copy` (host-assisted clone) kullanın. Bu durumda clone'lar parent'a hiç bağlanmaz. Dezavantajları: clone daha yavaştır, her disk tam boyutta yer kaplar ve ayar o StorageClass'ı kullanan **tüm** clone'ları etkiler.
+
+```bash
+oc get storageprofile <storageclass> -o yaml
+```
 
 ### Senaryo B: Uygulama VolumeSnapshot'ları birikmiş
 
@@ -243,5 +336,6 @@ oc -n openshift-storage exec "$TOOLS" -- ceph health detail
 
 - **Periyodik tarama:** `./rbd-snap-report.sh -a -t 150 -o json` komutunu bir cron/CI job'ında çalıştırın. Eşiğe yaklaşan image'ları alarm gelmeden yakalayın.
 - **VolumeSnapshot retention:** Snapshot alan her uygulama veya job için "son N" kuralı tanımlayın. VolumeSnapshotClass `deletionPolicy` değerinin `Delete` olduğundan emin olun.
+- **Custom template'ler:** Template'e DataSource üzerinden erişin ve VM sayısı ~150'ye ulaştığında template'i yeni bir sürüme döndürün (Senaryo A, adım 3). Snapshot sayısını ceph-csi soft limitinin (250) altında tutun.
 - **CNV:** DataImportCron'ların düzenli çalıştığını izleyin. Uzun ömürlü ve çok sayıda VM aynı kaynaktan üretiliyorsa bu VM'lerin disklerini periyodik olarak flatten edin. Kullanılmayan VM'leri temizleyin.
 - **Kayıt:** Her müdahaleden önce ve sonra `-o json` çıktısını arşivleyin.
