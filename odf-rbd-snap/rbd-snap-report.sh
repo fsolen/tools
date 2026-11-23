@@ -24,6 +24,12 @@ TOP=20
 VERBOSE=0
 IMAGE=""
 DEFAULT_POOL="ocs-storagecluster-cephblockpool"
+ALERT_LIMIT=200
+PLAN_SIZE=""
+CMDS_ONLY=0
+# ceph-csi varsayılanları (--minsnapshotsonimage / --maxsnapshotsonimage)
+CSI_MIN_SNAPS="${CSI_MIN_SNAPS:-250}"
+CSI_MAX_SNAPS="${CSI_MAX_SNAPS:-450}"
 
 usage() {
   cat <<EOF
@@ -43,13 +49,19 @@ Seçenekler:
   -a          Tarama modu: pool'daki tüm image'ların snapshot+child sayıları
   -t <n>      Tarama modunda işaretlenecek en düşük toplam (varsayılan: ${THRESHOLD})
   -T <n>      Listelerde gösterilecek en fazla satır       (varsayılan: ${TOP})
+  -L <n>      Alarm eşiği (flatten planı bunun altına indirecek kadar aday seçer) (varsayılan: ${ALERT_LIMIT})
+  -N <n>      Flatten planındaki aday sayısı (varsayılan: eşiğin altına inmek için gereken)
+  -F          Sadece flatten planının komutlarını yazdır (çalıştırmaz; gözden geçirip uygulayın)
   -h          Bu yardım
   -V          Sürüm
 
 Örnekler:
   $(basename "$0") csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971
   $(basename "$0") -o json csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971 > rapor.json
+  $(basename "$0") -F csi-vol-8b2716cd-5655-41e7-99d2-5745902b0971 > flatten-plan.sh
   $(basename "$0") -a -t 150
+
+Ortam değişkenleri: CSI_MIN_SNAPS (250), CSI_MAX_SNAPS (450): ceph-csi flatten limitleri
 EOF
 }
 
@@ -58,7 +70,7 @@ info() { echo ">> $*" >&2; }
 
 if [ "${1:-}" = "--help" ]; then usage; exit 0; fi
 
-while getopts ":n:p:r:o:t:T:avhV" opt; do
+while getopts ":n:p:r:o:t:T:L:N:FavhV" opt; do
   case "$opt" in
     n) ODF_NS="$OPTARG" ;;
     p) POOL="$OPTARG" ;;
@@ -66,6 +78,9 @@ while getopts ":n:p:r:o:t:T:avhV" opt; do
     o) OUTPUT="$OPTARG" ;;
     t) THRESHOLD="$OPTARG" ;;
     T) TOP="$OPTARG" ;;
+    L) ALERT_LIMIT="$OPTARG" ;;
+    N) PLAN_SIZE="$OPTARG" ;;
+    F) CMDS_ONLY=1 ;;
     a) SCAN=1 ;;
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
@@ -79,6 +94,9 @@ shift $((OPTIND - 1))
 case "$OUTPUT" in text|json) ;; *) die "-o text veya json olmalı" ;; esac
 case "$THRESHOLD" in ''|*[!0-9]*) die "-t sayı olmalı" ;; esac
 case "$TOP" in ''|*[!0-9]*) die "-T sayı olmalı" ;; esac
+case "$ALERT_LIMIT" in ''|*[!0-9]*) die "-L sayı olmalı" ;; esac
+case "$PLAN_SIZE" in *[!0-9]*) die "-N sayı olmalı" ;; esac
+case "$CSI_MIN_SNAPS$CSI_MAX_SNAPS" in *[!0-9]*) die "CSI_MIN_SNAPS / CSI_MAX_SNAPS sayı olmalı" ;; esac
 
 if [ "$SCAN" -eq 0 ]; then
   [ $# -eq 1 ] || { usage >&2; exit 1; }
@@ -106,7 +124,8 @@ EOF
   exit 2
 fi
 
-rbd() { oc -n "$ODF_NS" exec "$TOOLS" -- rbd "$@"; }
+rbd()  { oc -n "$ODF_NS" exec "$TOOLS" -- rbd "$@"; }
+ceph() { oc -n "$ODF_NS" exec "$TOOLS" -- ceph "$@"; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/rbd-snap-report.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
@@ -196,13 +215,20 @@ rbd info --format json "$SPEC" > "$TMP/info.json" 2>"$TMP/err" \
 rbd snap ls --all --format json "$SPEC" > "$TMP/snaps.json"
 rbd children --all --format json "$SPEC" > "$TMP/children.json"
 rbd children --all --descendants --format json "$SPEC" > "$TMP/desc.json"
-for f in snaps children desc; do
+# Opsiyonel: kaynak image'ın kullanılan boyutu (kapasite tahmini) ve mgr flatten görevleri
+rbd du --format json "$SPEC" > "$TMP/du.json" 2>/dev/null || echo '{}' > "$TMP/du.json"
+ceph rbd task list --format json > "$TMP/tasks.json" 2>/dev/null || echo '[]' > "$TMP/tasks.json"
+for f in snaps children desc tasks; do
   [ -s "$TMP/$f.json" ] || echo '[]' > "$TMP/$f.json"
 done
+[ -s "$TMP/du.json" ] || echo '{}' > "$TMP/du.json"
 
 info "Eşleştiriliyor"
 jq -n \
   --arg image "$IMAGE" --arg pool "$POOL" --arg radosns "$RADOS_NS" --arg driver "$DRIVER" \
+  --arg odfns "$ODF_NS" --arg tools "$TOOLS" --arg plansize "$PLAN_SIZE" \
+  --argjson alertlimit "$ALERT_LIMIT" --argjson csimin "$CSI_MIN_SNAPS" --argjson csimax "$CSI_MAX_SNAPS" \
+  --slurpfile du "$TMP/du.json" --slurpfile tasks "$TMP/tasks.json" \
   --slurpfile pv "$TMP/pv.json"   --slurpfile pvc "$TMP/pvc.json" \
   --slurpfile vsc "$TMP/vsc.json" --slurpfile vs "$TMP/vs.json" \
   --slurpfile vm "$TMP/vm.json"   --slurpfile ds "$TMP/ds.json" --slurpfile dic "$TMP/dic.json" \
@@ -217,12 +243,13 @@ jq -n \
     | from_entries ) as $pvmap
   | ( [ $pvc[0].items[]
       | { key: "\(.metadata.namespace)/\(.metadata.name)",
-          value: { owner: ([.metadata.ownerReferences[]? | "\(.kind)/\(.name)"] | join(",")),
+          value: { created: .metadata.creationTimestamp,
+                   owner: ([.metadata.ownerReferences[]? | "\(.kind)/\(.name)"] | join(",")),
                    labels: (.metadata.labels // {}) } } ]
     | from_entries ) as $pvcmap
   | ( reduce $vm[0].items[] as $v ({};
         reduce ( $v.spec.template.spec.volumes[]? | (.persistentVolumeClaim.claimName // .dataVolume.name // empty) ) as $c
-          (.; .["\($v.metadata.namespace)/\($c)"] = $v.metadata.name) ) ) as $vmmap
+          (.; .["\($v.metadata.namespace)/\($c)"] = { name: $v.metadata.name, status: ($v.status.printableStatus // "-") }) ) ) as $vmmap
   | ( [ $vs[0].items[] | { key: "\(.metadata.namespace)/\(.metadata.name)", value: true } ] | from_entries ) as $vsmap
   | ( [ $vsc[0].items[] | select(.spec.driver == $driver and .status.snapshotHandle? != null)
       | { key: (.status.snapshotHandle | uuid),
@@ -234,8 +261,10 @@ jq -n \
   | def pvinfo($n):
       $pvmap[$n] as $p
       | if $p == null then null
-        else $p + { vm: $vmmap["\($p.namespace)/\($p.pvc)"],
-                    owner: ($pvcmap["\($p.namespace)/\($p.pvc)"].owner // "") }
+        else $vmmap["\($p.namespace)/\($p.pvc)"] as $v
+          | $p + { vm: $v.name, vm_status: $v.status,
+                   pvc_created: $pvcmap["\($p.namespace)/\($p.pvc)"].created,
+                   owner: ($pvcmap["\($p.namespace)/\($p.pvc)"].owner // "") }
         end;
 
     def snapinfo($n):
@@ -300,13 +329,34 @@ jq -n \
   | ( [ $kids[] | select(.vm != null) | "\(.namespace)/\(.vm)" ] | unique | length ) as $vmcount
   | ( ($bykind.volumesnapshot // 0) as $a | ($srcvs | length) as $b | if $a > $b then $a else $b end ) as $vscount
   | ( ($srcds | length) > 0
-      or (($pvcmap["\($src.namespace)/\($src.pvc)"].labels // {}) | has("cdi.kubevirt.io/dataImportCron")) ) as $golden
+      or (($pvcmap["\($src.namespace)/\($src.pvc)"].labels // {}) | has("cdi.kubevirt.io/dataImportCron")) ) as $golden_cdi
+  # Kendisi bir VM diski olmayıp VM clone kaynağı olan PVC = custom golden image / template
+  | ( $src != null and $src.vm == null and $vmcount > 0 ) as $golden_custom
+  | ( $golden_cdi or $golden_custom ) as $golden
+  | ( if $golden_cdi then "DataSource/DataImportCron" elif $golden_custom then "custom template PVC" else null end ) as $golden_type
+
+  | ( $snaplist | length ) as $nsnaps
+  | ( [ $nsnaps, ($direct | length) ] | max ) as $count
+  | ( [ $count - $alertlimit + 1, 0 ] | max ) as $needed
+  | ( [ $du[0].images[]? | select(.snapshot == null and .name == $image) | .used_size ] | .[0] ) as $srcused
+  | ( [ $tasks[0][]? | select(.refs.action == "flatten") | .refs.image_name ] ) as $flattasks
+  | ( [ $kids[] | select(.direct and (.trash | not) and (.kind == "clone-intermediate" or .kind == "pvc-clone"))
+        | . + { queued: (.image as $i | $flattasks | index($i) != null) } ]
+      # Sıra: durdurulmuş VM diski, VM bağlantısız PVC, çalışan VM; her grupta en eski PVC önce.
+      # mgr kuyruğunda olanlar zaten flatten edileceği için plana alınmaz.
+      | sort_by([ .queued, (if .vm_status == "Stopped" then 0 elif .vm == null then 1 else 2 end), (.pvc_created // "") ]) ) as $candidates
+  | ( [ $candidates[] | select(.queued) ] | length ) as $nqueued
+  | ( if $plansize == "" then ([ $needed - $nqueued, 0 ] | max) else ($plansize | tonumber) end ) as $plann
+  | ( $candidates | map(select(.queued | not)) | .[:$plann]
+      | map({ image, pool, namespace, pvc, vm, vm_status, pvc_created,
+              command: "oc -n \($odfns) exec \($tools) -- rbd flatten \(.pool)/\(.image)" }) ) as $plan
 
   | {
       generated: (now | todate),
       image: $image, pool: $pool, rados_namespace: $radosns, driver: $driver,
       source: ( ($src // { note: "Bu image için PV bulunamadı (image orphan olabilir)" })
-                + { parent: $info[0].parent, size: $info[0].size, golden_image: $golden,
+                + { parent: $info[0].parent, size: $info[0].size, used_size: $srcused,
+                    golden_image: $golden, golden_type: $golden_type,
                     datasources: $srcds, dataimportcrons: $srcdic } ),
       summary: {
         snapshots_total: ($snaplist | length),
@@ -316,13 +366,30 @@ jq -n \
         descendants_by_kind: $bykind,
         vms_using_clones: $vmcount
       },
+      cephcsi: {
+        min_snapshots_on_image: $csimin, max_snapshots_on_image: $csimax,
+        state: (if $nsnaps > $csimax then "hard-limit" elif $nsnaps > $csimin then "soft-limit" else "ok" end),
+        flatten_tasks_queued: $nqueued,
+        flatten_tasks_total: ($flattasks | length)
+      },
+      flatten_plan: {
+        alert_limit: $alertlimit, current_count: $count, needed: $needed,
+        candidates_total: ($candidates | length),
+        estimated_capacity_bytes: (if $srcused then $srcused * ($plan | length) else null end),
+        estimated_capacity_bytes_all: (if $srcused then $srcused * ($candidates | length) else null end),
+        items: $plan
+      },
       snapshots: $snaplist,
       children: $kids,
       source_volumesnapshots: $srcvs,
       rbd_volumesnapshots_by_namespace: $nsvs,
       hints: [
+        ( select($nsnaps > $csimax)
+          | "KRİTİK: image üzerinde \($nsnaps) snapshot var (> ceph-csi maxsnapshotsonimage=\($csimax)). Bu kaynaktan yeni clone/snapshot ResourceExhausted ile reddedilir; ceph-csi tüm ara clone\u0027lar için flatten görevi ekler. Hemen flatten planını uygulayın (README: Senaryo A)." ),
+        ( select($nsnaps > $csimin and $nsnaps <= $csimax)
+          | "UYARI: image üzerinde \($nsnaps) snapshot var (> ceph-csi minsnapshotsonimage=\($csimin)). Bu kaynaktan alınacak bir sonraki clone, \($candidates | length) ara clone\u0027un TAMAMI için mgr flatten görevi kuyruğa ekletir (ani kapasite + I/O yükü). Bunu beklemeden kontrollü flatten yapın: -F ile plan üretin (README: Senaryo A)." ),
         ( select($vmcount > 0 or $golden)
-          | "CNV: \($vmcount) VM bu image\u0027dan clone edilmiş disk kullanıyor\(if $golden then " (golden image)" else "" end). Kullanılmayan VM\u0027leri silin veya seçili VM disklerini flatten edin; yeni VM\u0027ler için golden image yenilemesini kontrol edin (README: Senaryo A)." ),
+          | "CNV: \($vmcount) VM bu image\u0027dan clone edilmiş disk kullanıyor\(if $golden then " (golden image: \($golden_type))" else "" end). Alarm eşiğinin (\($alertlimit)) altına inmek için en az \($needed) direct child flatten edilmeli. Kullanılmayan VM\u0027leri silin veya seçili VM disklerini flatten edin; yeni VM\u0027ler için golden image yenilemesini kontrol edin (README: Senaryo A)." ),
         ( select($vscount > 0)
           | "VolumeSnapshot: bu PVC\u0027den \($vscount) snapshot alınmış. Eskileri oc delete volumesnapshot ile silin ve retention belirleyin (README: Senaryo B)." ),
         ( select(($bykind["vsc-only"] // 0) > 0)
@@ -334,15 +401,29 @@ jq -n \
       ]
     }' > "$TMP/report.json"
 
+if [ "$CMDS_ONLY" -eq 1 ]; then
+  jq -r '
+    "#!/usr/bin/env bash",
+    "# Flatten planı: \(.pool)/\(.image)  (\(.generated))",
+    "# Mevcut sayı: \(.flatten_plan.current_count), alarm eşiği: \(.flatten_plan.alert_limit), gereken: \(.flatten_plan.needed), plandaki: \(.flatten_plan.items | length)",
+    "# Tahmini ek kapasite: \(if .flatten_plan.estimated_capacity_bytes then "\(.flatten_plan.estimated_capacity_bytes / 1073741824 | floor) GiB (kaynak used_size x adet, üst sınır)" else "bilinmiyor" end)",
+    "# Önce: ceph df ile kapasiteyi kontrol edin. Komutlar sırayla (tek tek) çalışır.",
+    "set -euo pipefail",
+    ( .flatten_plan.items[] | "\(.command)   # \(.namespace // "-")/\(.pvc // "-") vm=\(.vm // "-") (\(.vm_status // "-"))" )
+  ' "$TMP/report.json"
+  exit 0
+fi
+
 if [ "$OUTPUT" = "json" ]; then
   cat "$TMP/report.json"
   exit 0
 fi
 
-jq -r --argjson top "$TOP" --argjson verbose "$VERBOSE" '
+jq -r --argjson top "$TOP" --argjson verbose "$VERBOSE" --arg script "$(basename "$0")" '
   def pad($n): tostring | if length >= $n then . else . + (" " * ($n - length)) end;
   def nz: if . == null or . == "" then "-" else . end;
   def kv: to_entries | map("\(.key)=\(.value)") | join("  ");
+  def gib: if . == null then "?" else "\(. / 1073741824 * 10 | floor / 10) GiB" end;
   def row: "  \(.image | pad(48)) \(.kind | pad(19)) \("\(.namespace | nz)/\(.pvc // .vs | nz)" | pad(45)) \(.vm | nz)\(if .note then "  # " + .note else "" end)";
 
   "=== HighRBDCloneSnapshotCount analizi (\(.generated)) ===",
@@ -350,7 +431,8 @@ jq -r --argjson top "$TOP" --argjson verbose "$VERBOSE" '
   "PV / PVC       : \(.source.pv | nz)  \(.source.namespace | nz)/\(.source.pvc | nz)",
   "VM / Owner     : \(.source.vm | nz)  \(.source.owner | nz)",
   "Parent         : \(if .source.parent then "\(.source.parent.pool)/\(.source.parent.image)@\(.source.parent.snapshot)" else "-" end)",
-  "Golden image   : \(if .source.golden_image then "EVET" else "hayır" end)",
+  "Boyut          : \(.source.size | gib) (kullanılan: \(.source.used_size | gib))",
+  "Golden image   : \(if .source.golden_image then "EVET (\(.source.golden_type))" else "hayır" end)",
   ( .source.datasources[]     | "  DataSource     : \(.namespace)/\(.name)" ),
   ( .source.dataimportcrons[] | "  DataImportCron : \(.namespace)/\(.name)  schedule=\(.schedule | nz)  importsToKeep=\(.importsToKeep)  lastImport=\(.lastImport | nz)" ),
   ( .source.note // empty | "Not            : \(.)" ),
@@ -360,6 +442,21 @@ jq -r --argjson top "$TOP" --argjson verbose "$VERBOSE" '
   "Direct child             : \(.summary.children_direct)",
   "Tüm child (descendants)  : \(.summary.descendants_total)   [\(.summary.descendants_by_kind | kv)]",
   "Clone kullanan VM sayısı : \(.summary.vms_using_clones)",
+  "",
+  "--- ceph-csi otomatik flatten durumu ---",
+  "Snapshot sayısı \(.summary.snapshots_total) / soft limit \(.cephcsi.min_snapshots_on_image) / hard limit \(.cephcsi.max_snapshots_on_image)  ->  \(
+     { "ok": "OK", "soft-limit": "SOFT LIMIT AŞILDI: bir sonraki clone tüm ara clone\u0027lar için flatten görevi ekletir",
+       "hard-limit": "HARD LIMIT AŞILDI: yeni clone/snapshot reddedilir" }[.cephcsi.state])",
+  "mgr flatten görevleri: bu image\u0027ın child\u0027ları için \(.cephcsi.flatten_tasks_queued), toplam \(.cephcsi.flatten_tasks_total)",
+  "",
+  "--- Flatten planı (alarm eşiği \(.flatten_plan.alert_limit)) ---",
+  "Mevcut sayı \(.flatten_plan.current_count)  ->  eşiğin altına inmek için en az \(.flatten_plan.needed) direct child flatten edilmeli (aday: \(.flatten_plan.candidates_total), mgr kuyruğunda: \(.cephcsi.flatten_tasks_queued), planda: \(.flatten_plan.items | length))",
+  "Tahmini ek kapasite: plan \(.flatten_plan.estimated_capacity_bytes | gib), tüm adaylar \(.flatten_plan.estimated_capacity_bytes_all | gib)  (kaynak used_size x adet, üst sınır)",
+  ( if (.flatten_plan.items | length) == 0 then "  (plan boş)" else
+      (.flatten_plan.items[:$top][] | "  \(.image | pad(50)) \("\(.namespace // "-")/\(.vm // "-")" | pad(40)) \(.vm_status // "-" | pad(10)) \(.pvc_created // "-")"),
+      ( select((.flatten_plan.items | length) > $top) | "  ... toplam \(.flatten_plan.items | length) aday; tamamı için: -F" )
+    end ),
+  "Komutları üretmek için: \($script) -F \(.image) > flatten-plan.sh",
   "",
   "--- Namespace bazında child dağılımı (ilk \($top)) ---",
   ( [ .children[] | select(.kind == "pvc-clone" or .kind == "clone-intermediate" or .kind == "volumesnapshot") ]
